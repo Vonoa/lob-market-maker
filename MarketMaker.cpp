@@ -1,44 +1,39 @@
 #include "MarketMaker.h"
 #include "FairValueModel.h"
+#include "Logging.h"
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 
-MarketMaker::MarketMaker(OrderBook& orderBook, MatchingEngine& matchingEngine)
-    : orderBook(orderBook), matchingEngine(matchingEngine),
-      currentBidId(NO_QUOTE_ID), currentAskId(NO_QUOTE_ID) {}
+MarketMaker::MarketMaker(OrderBook& orderBook, MatchingEngine& matchingEngine, Strategy& strategy,
+                          int64_t maxInventory, int64_t maxOrderSize, double maxloss, double maxExposure)
+    : orderBook(orderBook), matchingEngine(matchingEngine), strategy(strategy),
+      currentBidId(NO_QUOTE_ID), currentAskId(NO_QUOTE_ID),
+      maxInventory(maxInventory), maxOrderSize(maxOrderSize),
+      maxloss(maxloss), maxExposure(maxExposure) {}
 
 double MarketMaker::calcMidPrice() const {
     double bestBid = orderBook.bestBid();
     double bestAsk = orderBook.bestAsk();
 
     if (bestBid == 0.0 || bestAsk == 0.0) {
-        std::cerr << "Error: Cannot calculate mid-price with no bids or asks." << std::endl;
-        return 0.0;
+        // No live two-sided book right now (e.g. right after cancelQuotes() pulled our
+        // own resting orders, which are often the only liquidity present). Fall back to
+        // the fair value model's running estimate from past trades rather than returning
+        // 0.0 - letting a fake "price of zero" flow into reservationPrice()/effectiveSpread()
+        // is what produced nonsensical (even negative) quoted prices.
+        return fairValueModel.getFairValue();
     }
 
     return (bestBid + bestAsk) / 2.0;
 }
 
-double MarketMaker::reservationPrice() const {
-    return calcMidPrice() - skewCoefficient * inventory / 2.0;
+Order MarketMaker::createBid(double price, int64_t quantity) const {
+    return createOrder(OrderSide::BUY, price, quantity);
 }
 
-double MarketMaker::effectiveSpread() const {
-    return orderBook.spread() + volatilityMultiplier * fairValueModel.getVolatility();
-}
-
-Order MarketMaker::createBid(int quantity) const {
-    double mid = reservationPrice();
-    double bidPrice = mid - effectiveSpread() / 2.0; // Place bid below mid-price
-
-    return createOrder(OrderSide::BUY, bidPrice, quantity);
-}
-
-Order MarketMaker::createAsk(int quantity) const {
-    double mid = reservationPrice();
-    double askPrice = mid + effectiveSpread() / 2.0; // Place ask above mid-price
-
-    return createOrder(OrderSide::SELL, askPrice, quantity);
+Order MarketMaker::createAsk(double price, int64_t quantity) const {
+    return createOrder(OrderSide::SELL, price, quantity);
 }
 
 void MarketMaker::cancelQuotes() {
@@ -52,7 +47,7 @@ void MarketMaker::cancelQuotes() {
     }
 }
 
-int MarketMaker::getInventory() const {
+int64_t MarketMaker::getInventory() const {
     return inventory;
 }
 
@@ -64,7 +59,7 @@ bool MarketMaker::canSell() const {
     return inventory > -maxInventory;
 }
 
-void MarketMaker::updateInventory(int quantityChange, OrderSide side) {
+void MarketMaker::updateInventory(int64_t quantityChange, OrderSide side) {
     if (side == OrderSide::BUY) {
         inventory += quantityChange;
     } else if (side == OrderSide::SELL) {
@@ -82,7 +77,7 @@ double MarketMaker::getRealisedPnL() const {
 
 // Must be called with the position as it stood BEFORE this fill (i.e. before updateInventory
 // runs), since which of the three cases applies depends on the pre-fill sign and size.
-void MarketMaker::updateCostBasis(int quantity, double price, OrderSide side) {
+void MarketMaker::updateCostBasis(int64_t quantity, double price, OrderSide side) {
     int dir = (side == OrderSide::BUY) ? 1 : -1;
 
     if (inventory == 0) {
@@ -95,17 +90,17 @@ void MarketMaker::updateCostBasis(int quantity, double price, OrderSide side) {
 
     if (dir == positionSign) {
         // Adding to the existing position: roll the fill into a size-weighted average.
-        int absInventory = std::abs(inventory);
+        int64_t absInventory = std::abs(inventory);
         avgCostBasis = (avgCostBasis * absInventory + price * quantity) / (absInventory + quantity);
     } else {
         // Reducing (or flipping) the position.
-        int closingQty = std::min(quantity, std::abs(inventory));
+        int64_t closingQty = std::min(quantity, std::abs(inventory));
 
         // Booked here, not in onTrade(): this is the only place that knows this fill is
         // actually closing exposure (vs. opening/adding), and has the pre-fill avgCostBasis.
         realisedPnL += positionSign * (price - avgCostBasis) * closingQty;
 
-        int remainingQty = quantity - closingQty;
+        int64_t remainingQty = quantity - closingQty;
         if (remainingQty > 0) {
             // The fill was bigger than the open position, so it flips sides -
             // the leftover opens a brand new position at this fill's price.
@@ -130,10 +125,23 @@ double MarketMaker::getUnrealisedPnL() const {
 double MarketMaker::getTotalPnL() const {
     double totalPnl = realisedPnL + getUnrealisedPnL();
     double checkTotalPnl = cash + inventory * calcMidPrice() - startingCash;
-    if (std::abs(totalPnl - checkTotalPnl) > 1e-6) {
+    // Relative, not absolute: at BTC-scale values (~1e9-1e11 after the quantity scaling
+    // and thousands of accumulated cash updates), a fixed absolute tolerance trips
+    // constantly on ordinary floating-point noise. 1e-9 relative was still too tight for
+    // that accumulation depth - 1e-6 stays far tighter than any real accounting bug would
+    // produce while tolerating double-precision drift at this magnitude.
+    double scale = std::max({1.0, std::abs(totalPnl), std::abs(checkTotalPnl)});
+    if (std::abs(totalPnl - checkTotalPnl) / scale > 1e-6) {
         std::cerr << "Warning: Total PnL mismatch! TotalPnL: " << totalPnl << ", CheckTotalPnl: " << checkTotalPnl << std::endl;
     }
     return totalPnl;
+}
+
+double MarketMaker::getAdverseSelectionRatio() const {
+    if (totalFillCount == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(adverseFillCount) / totalFillCount;
 }
 
 double MarketMaker::getExposure() const {
@@ -150,6 +158,17 @@ void MarketMaker::onTrade(const Trade& trade) {
     bool filledBid = trade.buyOrderId == currentBidId;
     bool filledAsk = trade.sellOrderId == currentAskId;
 
+    // Resolve the PREVIOUS pending fill using whatever price info has arrived since -
+    // including this trade's own price, already folded into fairValueModel above.
+    if (hasLastFill) {
+        double currentFairValue = fairValueModel.getFairValue();
+        bool adverse = (lastFillSide == OrderSide::BUY && currentFairValue < lastFillPrice)
+                     || (lastFillSide == OrderSide::SELL && currentFairValue > lastFillPrice);
+        if (adverse) adverseFillCount++;
+        totalFillCount++;
+        hasLastFill = false;
+    }
+
     if (filledBid && filledAsk) {
         std::cerr << "Warning: self-trade between MarketMaker's own bid (" << currentBidId
                    << ") and ask (" << currentAskId << "); inventory left unchanged." << std::endl;
@@ -160,11 +179,17 @@ void MarketMaker::onTrade(const Trade& trade) {
         updateCostBasis(trade.quantity, trade.price, OrderSide::BUY);
         updateInventory(trade.quantity, OrderSide::BUY);
         cash -= trade.quantity * trade.price;
+        lastFillPrice = trade.price;
+        lastFillSide = OrderSide::BUY;
+        hasLastFill = true; // judged next time a new price observation comes in
     }
     if (filledAsk) {
         updateCostBasis(trade.quantity, trade.price, OrderSide::SELL);
         updateInventory(trade.quantity, OrderSide::SELL);
         cash += trade.quantity * trade.price;
+        lastFillPrice = trade.price;
+        lastFillSide = OrderSide::SELL;
+        hasLastFill = true; // judged next time a new price observation comes in
     }
 
     // Checked after this fill's effects are applied, so it judges PnL that actually
@@ -177,40 +202,56 @@ void MarketMaker::onTrade(const Trade& trade) {
     }
 }
 
-void MarketMaker::quote(int quantity) {
+void MarketMaker::quote(int64_t quantity) {
     if (killswitch) {
-        std::cout << "Market Maker halted - kill switch active. Call resetKillSwitch() to resume.\n";
+        if (Logging::currentLevel >= LogLevel::Debug) {
+            std::cout << "Market Maker halted - kill switch active. Call resetKillSwitch() to resume.\n";
+        }
         return;
     }
 
-    if (orderBook.bestBid() == 0.0 || orderBook.bestAsk() == 0.0) {
-        std::cerr << "Error: Cannot quote without an existing two-sided market." << std::endl;
+    // Checks calcMidPrice() itself (live book, or the fair-value fallback), not the raw
+    // book directly - the raw book alone would still fail this the instant cancelQuotes()
+    // below pulls our own resting orders, even though we can now still price off fair value.
+    if (calcMidPrice() == 0.0) {
+        std::cerr << "Error: Cannot quote - no live market and no fair value history yet." << std::endl;
         return;
     }
-    int size = std::min(quantity, maxOrderSize); // clamp to the max single-order size rather than refusing to quote at all
+    int64_t size = std::min(quantity, maxOrderSize); // clamp to the max single-order size rather than refusing to quote at all
+
+    // Computed once, up front, so both sides price off the exact same snapshot of
+    // market state rather than risking it changing between two separate calls.
+    Quote thisQuote = strategy.computeQuote(calcMidPrice(), inventory, fairValueModel.getVolatility(), orderBook.spread());
 
     cancelQuotes();
 
-    std::cout << "Market Maker Quotes:\n";
+    bool verbose = Logging::currentLevel >= LogLevel::Debug;
+    if (verbose) {
+        std::cout << "Market Maker Quotes:\n";
+    }
 
     // Route through the matching engine (not orderBook.addOrder directly) so a quote
     // that crosses the touch - e.g. once skew shifts it off center - actually executes
     // instead of resting uncrossed in the book.
     if (canBuy()) {
-        Order bid = createBid(size);
+        Order bid = createBid(thisQuote.bidPrice, size);
         currentBidId = bid.id; // set before process() so onTrade can attribute an immediate fill
         matchingEngine.process(bid);
-        printOrder(bid);
-    } else {
+        if (verbose) {
+            printOrder(bid);
+        }
+    } else if (verbose) {
         std::cout << "  bid suppressed - at max inventory (" << inventory << "/" << maxInventory << ")\n";
     }
 
     if (canSell()) {
-        Order ask = createAsk(size);
+        Order ask = createAsk(thisQuote.askPrice, size);
         currentAskId = ask.id; // set before process() so onTrade can attribute an immediate fill
         matchingEngine.process(ask);
-        printOrder(ask);
-    } else {
+        if (verbose) {
+            printOrder(ask);
+        }
+    } else if (verbose) {
         std::cout << "  ask suppressed - at min inventory (" << inventory << "/-" << maxInventory << ")\n";
     }
 }
@@ -226,4 +267,6 @@ void MarketMaker::printStatus() const {
     std::cout << "  Unrealised PnL: " << getUnrealisedPnL() << "\n";
     std::cout << "  Total PnL: " << getTotalPnL() << "\n";
     std::cout << "  Exposure: " << getExposure() << "\n";
+    std::cout << "  Adverse Selection Ratio: " << getAdverseSelectionRatio()
+               << " (" << adverseFillCount << "/" << totalFillCount << ")\n";
 }
