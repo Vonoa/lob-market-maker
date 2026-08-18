@@ -1,4 +1,5 @@
 #include "OrderBook.h"
+#include "Logging.h"
 #include <algorithm>
 #include <iostream>
 
@@ -96,10 +97,12 @@ bool OrderBook::cancelOrder(int orderId) {
 
     bool canceled = removeOrder(bids) || removeOrder(asks);
 
-    if (canceled) {
-        std::cout << "Order with ID " << orderId << " canceled." << std::endl;
-    } else {
-        std::cout << "Order with ID " << orderId << " not found." << std::endl;
+    if (Logging::currentLevel >= LogLevel::Debug) {
+        if (canceled) {
+            std::cout << "Order with ID " << orderId << " canceled." << std::endl;
+        } else {
+            std::cout << "Order with ID " << orderId << " not found." << std::endl;
+        }
     }
 
     return canceled;
