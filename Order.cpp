@@ -2,7 +2,7 @@
 #include <iostream>
 
 // Creating a Order
-Order createOrder(OrderSide side, double price, int quantity) {
+Order createOrder(OrderSide side, double price, int64_t quantity) {
     static int nextId = 1;
 
     Order order;
@@ -15,7 +15,7 @@ Order createOrder(OrderSide side, double price, int quantity) {
 }
 
 // Function to reduce the quantity of an Order
-void reduceOrderQuantity(Order& order, int amount) {
+void reduceOrderQuantity(Order& order, int64_t amount) {
     if (amount < 0) {
         std::cerr << "Error: Cannot reduce by a negative quantity." << std::endl;
         return;
