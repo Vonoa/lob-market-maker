@@ -1,4 +1,5 @@
 #include "MatchingEngine.h"
+#include "Logging.h"
 #include <algorithm>
 #include <iostream>
 
@@ -21,7 +22,7 @@ void MatchingEngine::process(Order order) {
                 break;
             }
 
-            int tradeQuantity = std::min(order.quantity, ask->quantity);
+            int64_t tradeQuantity = std::min(order.quantity, ask->quantity);
 
             Trade trade{
                 nextTradeId,
@@ -35,7 +36,9 @@ void MatchingEngine::process(Order order) {
 
             trades.push_back(trade);
 
-            std::cout << "Trade executed:" << tradeQuantity << " @ " << ask->price << std::endl;
+            if (Logging::currentLevel >= LogLevel::Trades) {
+                std::cout << "Trade executed:" << tradeQuantity << " @ " << ask->price << std::endl;
+            }
 
             // Finish all bookkeeping on `ask` before notifying listeners - onTrade() may run
             // logic (e.g. a kill switch) that cancels orders, which can erase this very order
@@ -63,7 +66,7 @@ void MatchingEngine::process(Order order) {
                 break;
             }
 
-            int tradeQuantity = std::min(order.quantity, bid->quantity);
+            int64_t tradeQuantity = std::min(order.quantity, bid->quantity);
 
             Trade trade{
                 nextTradeId,
@@ -77,7 +80,9 @@ void MatchingEngine::process(Order order) {
 
             trades.push_back(trade);
 
-            std::cout << "Trade executed:" << tradeQuantity << " @ " << bid->price << std::endl;
+            if (Logging::currentLevel >= LogLevel::Trades) {
+                std::cout << "Trade executed:" << tradeQuantity << " @ " << bid->price << std::endl;
+            }
 
             // Finish all bookkeeping on `bid` before notifying listeners - onTrade() may run
             // logic (e.g. a kill switch) that cancels orders, which can erase this very order
