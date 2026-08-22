@@ -28,6 +28,18 @@ double MarketMaker::calcMidPrice() const {
     return (bestBid + bestAsk) / 2.0;
 }
 
+// See the header for why this exists. Same selection quote() already applied to the
+// strategy's reservation price - now shared, so marks and quotes cannot disagree.
+double MarketMaker::referencePrice() const {
+    if (useTradeBasedReference) {
+        double fairValue = fairValueModel.getFairValue();
+        if (fairValue != 0.0) { // falls back to the book before the first observation
+            return fairValue;
+        }
+    }
+    return calcMidPrice();
+}
+
 Order MarketMaker::createBid(double price, int64_t quantity) const {
     return createOrder(OrderSide::BUY, price, quantity);
 }
@@ -40,10 +52,12 @@ void MarketMaker::cancelQuotes() {
     if (currentBidId != NO_QUOTE_ID) {
         orderBook.cancelOrder(currentBidId);
         currentBidId = NO_QUOTE_ID;
+        lastBidPrice = 0.0;
     }
     if (currentAskId != NO_QUOTE_ID) {
         orderBook.cancelOrder(currentAskId);
         currentAskId = NO_QUOTE_ID;
+        lastAskPrice = 0.0;
     }
 }
 
@@ -114,17 +128,21 @@ double MarketMaker::getUnrealisedPnL() const {
         return 0.0;
     }
 
-    double midPrice = calcMidPrice();
-    if (midPrice == 0.0) {
+    // referencePrice(), not calcMidPrice() - marking an open position against a stale book
+    // made unrealised P&L swing on book staleness rather than on real price moves.
+    double markPrice = referencePrice();
+    if (markPrice == 0.0) {
         return 0.0; // no reliable price available right now - don't report a bogus swing
     }
     int positionSign = (inventory > 0) ? 1 : -1;
 
-    return positionSign * (midPrice - avgCostBasis) * std::abs(inventory);
+    return positionSign * (markPrice - avgCostBasis) * std::abs(inventory);
 }
 double MarketMaker::getTotalPnL() const {
     double totalPnl = realisedPnL + getUnrealisedPnL();
-    double checkTotalPnl = cash + inventory * calcMidPrice() - startingCash;
+    // Must use the SAME price getUnrealisedPnL() marks against, or the two sides of this
+    // reconciliation are computed off different prices and the warning fires constantly.
+    double checkTotalPnl = cash + inventory * referencePrice() - startingCash;
     // Relative, not absolute: at BTC-scale values (~1e9-1e11 after the quantity scaling
     // and thousands of accumulated cash updates), a fixed absolute tolerance trips
     // constantly on ordinary floating-point noise. 1e-9 relative was still too tight for
@@ -138,40 +156,147 @@ double MarketMaker::getTotalPnL() const {
 }
 
 double MarketMaker::getAdverseSelectionRatio() const {
-    if (totalFillCount == 0) {
+    if (judgedFillCount == 0) {
         return 0.0;
     }
-    return static_cast<double>(adverseFillCount) / totalFillCount;
+    // judgedFillCount, not totalFillCount - see the header. Only fills that have had a later
+    // price observation to be judged against belong in this denominator.
+    return static_cast<double>(adverseFillCount) / judgedFillCount;
+}
+
+int MarketMaker::getSelfTradeCount() const {
+    return selfTradeCount;
+}
+
+int MarketMaker::getCannotQuoteCount() const {
+    return cannotQuoteCount;
+}
+
+double MarketMaker::getInventoryPnL() const {
+    return inventoryPnL;
+}
+
+// The residual after inventoryPnL is pulled out of totalPnL - i.e. P&L from the act of
+// trading itself (buying/selling at prices better or worse than fair value), independent
+// of which way the market happened to drift while inventory was held.
+double MarketMaker::getSpreadPnL() const {
+    return getTotalPnL() - inventoryPnL;
+}
+
+double MarketMaker::getMyBid() const {
+    return lastBidPrice;
+}
+
+double MarketMaker::getMyAsk() const {
+    return lastAskPrice;
+}
+
+int64_t MarketMaker::getMaxInventory() const {
+    return maxInventory;
+}
+
+double MarketMaker::getCash() const {
+    return cash;
+}
+
+bool MarketMaker::isKillSwitchActive() const {
+    return killswitch;
+}
+
+int MarketMaker::getTotalFillCount() const {
+    return totalFillCount;
+}
+
+int MarketMaker::getBuyFillCount() const {
+    return buyFillCount;
+}
+
+int MarketMaker::getSellFillCount() const {
+    return sellFillCount;
+}
+
+int64_t MarketMaker::getTotalFilledVolume() const {
+    return totalFilledVolume;
+}
+
+double MarketMaker::getFairValue() const {
+    return fairValueModel.getFairValue();
+}
+
+void MarketMaker::setUseTradeBasedReference(bool value) {
+    useTradeBasedReference = value;
+}
+
+void MarketMaker::recordExternalPrice(double price) {
+    fairValueModel.recordPrice(price);
 }
 
 double MarketMaker::getExposure() const {
-    double midPrice = calcMidPrice();
-    if (midPrice == 0.0) {
+    // referencePrice(), not calcMidPrice() - this feeds the kill switch, so valuing the
+    // position off a stale book could trip it on a phantom move, or fail to on a real one.
+    double markPrice = referencePrice();
+    if (markPrice == 0.0) {
         return 0.0; // no reliable price available right now - don't report bogus exposure
     }
-    return std::abs(inventory) * midPrice;
+    return std::abs(inventory) * markPrice;
 }
 
 void MarketMaker::onTrade(const Trade& trade) {
-    fairValueModel.recordPrice(trade.price); // every fill is a real market price observation
+    // trade.price is the RESTING order's price (see MatchingEngine::process),
+    // not an independent market observation - when this MM's own quote is
+    // what's resting (routine at BTC scale, where quoteSize dwarfs typical
+    // trade sizes and the MM dominates top-of-book), trade.price IS the MM's
+    // own last quote. Feeding that back into fairValueModel is self-referential:
+    // it both inflates adverse-selection judgments (the "market" the MM is
+    // being graded against is partly itself) and re-closes the quote-feedback
+    // loop that setUseTradeBasedReference was meant to fix. Skipped whenever
+    // an external, non-self-referential feed exists instead (see
+    // recordExternalPrice() and its caller in SimulationEngine::step()) -
+    // Synthetic mode has no such external feed, so it still needs this.
+    if (!useTradeBasedReference) {
+        fairValueModel.recordPrice(trade.price); // every fill is a real market price observation
+    }
+
+    // P&L attribution: mark-to-market the position we were ALREADY holding against this
+    // trade's price, before applying this trade's own fill effects below. That ordering is
+    // what keeps inventoryPnL isolated to "price moved while we held inventory" and out of
+    // "we bought/sold at a price different from fair value" (which lands in spreadPnL
+    // instead, via getSpreadPnL() = getTotalPnL() - inventoryPnL).
+    double newMark = referencePrice();
+    if (hasMarkPrice) {
+        inventoryPnL += static_cast<double>(inventory) * (newMark - lastMarkPrice);
+    }
+    lastMarkPrice = newMark;
+    hasMarkPrice = true;
 
     bool filledBid = trade.buyOrderId == currentBidId;
     bool filledAsk = trade.sellOrderId == currentAskId;
 
     // Resolve the PREVIOUS pending fill using whatever price info has arrived since -
     // including this trade's own price, already folded into fairValueModel above.
+    // Only the adverse JUDGEMENT is deferred here; the fill counts themselves are taken at
+    // fill time below. Counting here too used to lag every count by one fill and drop the
+    // last fill of a run entirely, since nothing arrives afterwards to resolve it.
     if (hasLastFill) {
         double currentFairValue = fairValueModel.getFairValue();
         bool adverse = (lastFillSide == OrderSide::BUY && currentFairValue < lastFillPrice)
                      || (lastFillSide == OrderSide::SELL && currentFairValue > lastFillPrice);
         if (adverse) adverseFillCount++;
-        totalFillCount++;
+        judgedFillCount++;
         hasLastFill = false;
     }
 
     if (filledBid && filledAsk) {
-        std::cerr << "Warning: self-trade between MarketMaker's own bid (" << currentBidId
-                   << ") and ask (" << currentAskId << "); inventory left unchanged." << std::endl;
+        selfTradeCount++;
+        if (selfTradeCount == 1) {
+            // Fire-once: the first occurrence is worth seeing immediately, but a run that
+            // does this repeatedly would otherwise spam stderr once per fill. The running
+            // count (via getSelfTradeCount()) still shows the full extent in printStatus()/
+            // the eventual run summary.
+            std::cerr << "Warning: self-trade between MarketMaker's own bid (" << currentBidId
+                       << ") and ask (" << currentAskId << "); inventory left unchanged. "
+                       << "(further self-trades this run will be counted but not logged)" << std::endl;
+        }
         return;
     }
 
@@ -182,6 +307,9 @@ void MarketMaker::onTrade(const Trade& trade) {
         lastFillPrice = trade.price;
         lastFillSide = OrderSide::BUY;
         hasLastFill = true; // judged next time a new price observation comes in
+        totalFillCount++;   // counted now, not when judged - see the resolution block above
+        buyFillCount++;
+        totalFilledVolume += trade.quantity;
     }
     if (filledAsk) {
         updateCostBasis(trade.quantity, trade.price, OrderSide::SELL);
@@ -190,6 +318,9 @@ void MarketMaker::onTrade(const Trade& trade) {
         lastFillPrice = trade.price;
         lastFillSide = OrderSide::SELL;
         hasLastFill = true; // judged next time a new price observation comes in
+        totalFillCount++;   // counted now, not when judged - see the resolution block above
+        sellFillCount++;
+        totalFilledVolume += trade.quantity;
     }
 
     // Checked after this fill's effects are applied, so it judges PnL that actually
@@ -214,14 +345,34 @@ void MarketMaker::quote(int64_t quantity) {
     // book directly - the raw book alone would still fail this the instant cancelQuotes()
     // below pulls our own resting orders, even though we can now still price off fair value.
     if (calcMidPrice() == 0.0) {
-        std::cerr << "Error: Cannot quote - no live market and no fair value history yet." << std::endl;
+        cannotQuoteCount++;
+        if (cannotQuoteCount == 1) {
+            // Fire-once: a stalled book means this would otherwise print every single tick
+            // until data resumes, drowning out everything else. The count is still tracked
+            // so a long stall is visible in printStatus()/the run summary.
+            std::cerr << "Error: Cannot quote - no live market and no fair value history yet. "
+                       << "(further occurrences this run will be counted but not logged)" << std::endl;
+        }
         return;
     }
     int64_t size = std::min(quantity, maxOrderSize); // clamp to the max single-order size rather than refusing to quote at all
 
+    // Reference price for the STRATEGY's own pricing decision. Ordinarily
+    // just calcMidPrice() (the live book) - useTradeBasedReference switches
+    // to fairValueModel's EWMA of real trade prices instead, for the case
+    // where this MM's own resting orders can dominate book liquidity (BTC
+    // scale, where quoteSize dwarfs real trade sizes): calcMidPrice() would
+    // otherwise mostly reflect the MM's own last quote, so re-centering the
+    // NEXT quote on it compounds into a feedback loop with nothing anchoring
+    // it to the real market. fairValue only moves on actual trade prints
+    // (recordPrice() in onTrade(), called for every trade regardless of who
+    // was on either side), so it can't be driven by the MM's own resting
+    // orders sitting untouched in the book.
+    double reference = referencePrice();
+
     // Computed once, up front, so both sides price off the exact same snapshot of
     // market state rather than risking it changing between two separate calls.
-    Quote thisQuote = strategy.computeQuote(calcMidPrice(), inventory, fairValueModel.getVolatility(), orderBook.spread());
+    Quote thisQuote = strategy.computeQuote(reference, inventory, fairValueModel.getVolatility(), orderBook.spread());
 
     cancelQuotes();
 
@@ -233,9 +384,15 @@ void MarketMaker::quote(int64_t quantity) {
     // Route through the matching engine (not orderBook.addOrder directly) so a quote
     // that crosses the touch - e.g. once skew shifts it off center - actually executes
     // instead of resting uncrossed in the book.
+    // canBuy()/canSell() only decide WHETHER to quote a side. On their own they let a fill
+    // carry inventory past the limit by up to (size - 1), since nothing stopped a full-size
+    // quote going out with only a sliver of headroom left. Clamping to the remaining headroom
+    // is what makes maxInventory an actual limit rather than a trigger.
     if (canBuy()) {
-        Order bid = createBid(thisQuote.bidPrice, size);
+        int64_t bidSize = std::min(size, maxInventory - inventory);
+        Order bid = createBid(thisQuote.bidPrice, bidSize);
         currentBidId = bid.id; // set before process() so onTrade can attribute an immediate fill
+        lastBidPrice = thisQuote.bidPrice;
         matchingEngine.process(bid);
         if (verbose) {
             printOrder(bid);
@@ -245,8 +402,10 @@ void MarketMaker::quote(int64_t quantity) {
     }
 
     if (canSell()) {
-        Order ask = createAsk(thisQuote.askPrice, size);
+        int64_t askSize = std::min(size, maxInventory + inventory); // headroom on the short side
+        Order ask = createAsk(thisQuote.askPrice, askSize);
         currentAskId = ask.id; // set before process() so onTrade can attribute an immediate fill
+        lastAskPrice = thisQuote.askPrice;
         matchingEngine.process(ask);
         if (verbose) {
             printOrder(ask);
@@ -266,7 +425,12 @@ void MarketMaker::printStatus() const {
     std::cout << "  Realised PnL: " << realisedPnL << "\n";
     std::cout << "  Unrealised PnL: " << getUnrealisedPnL() << "\n";
     std::cout << "  Total PnL: " << getTotalPnL() << "\n";
+    std::cout << "  Spread PnL: " << getSpreadPnL() << "\n";
+    std::cout << "  Inventory PnL: " << getInventoryPnL() << "\n";
     std::cout << "  Exposure: " << getExposure() << "\n";
     std::cout << "  Adverse Selection Ratio: " << getAdverseSelectionRatio()
-               << " (" << adverseFillCount << "/" << totalFillCount << ")\n";
+               << " (" << adverseFillCount << "/" << judgedFillCount << " judged, "
+               << totalFillCount << " filled)\n";
+    std::cout << "  Self-Trades: " << selfTradeCount << "\n";
+    std::cout << "  Cannot-Quote Occurrences: " << cannotQuoteCount << "\n";
 }

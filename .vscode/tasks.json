@@ -8,22 +8,27 @@
                 "-fdiagnostics-color=always",
                 "-g",
                 "-std=c++17",
-                "${fileDirname}\\main.cpp",
-                "${fileDirname}\\Order.cpp",
-                "${fileDirname}\\OrderBook.cpp",
-                "${fileDirname}\\MatchingEngine.cpp",
-                "${fileDirname}\\MarketMaker.cpp",
-                "${fileDirname}\\FairValueModel.cpp",
-                "${fileDirname}\\RandomTrader.cpp",
-                "${fileDirname}\\DefaultStrategy.cpp",
-                "${fileDirname}\\FixedSpreadStrategy.cpp",
-                "${fileDirname}\\HistoricalDataReplay.cpp",
-                "${fileDirname}\\Logging.cpp",
+                "-I${workspaceFolder}\\core",
+                "-I${workspaceFolder}\\strategies",
+                "-I${workspaceFolder}\\simulation",
+                "${workspaceFolder}\\main.cpp",
+                "${workspaceFolder}\\core\\Order.cpp",
+                "${workspaceFolder}\\core\\OrderBook.cpp",
+                "${workspaceFolder}\\core\\MatchingEngine.cpp",
+                "${workspaceFolder}\\core\\MarketMaker.cpp",
+                "${workspaceFolder}\\core\\FairValueModel.cpp",
+                "${workspaceFolder}\\core\\Logging.cpp",
+                "${workspaceFolder}\\strategies\\DefaultStrategy.cpp",
+                "${workspaceFolder}\\strategies\\FixedSpreadStrategy.cpp",
+                "${workspaceFolder}\\simulation\\RandomTrader.cpp",
+                "${workspaceFolder}\\simulation\\HistoricalDataReplay.cpp",
+                "${workspaceFolder}\\simulation\\SimulationEngine.cpp",
+                "${workspaceFolder}\\simulation\\Recorder.cpp",
                 "-o",
-                "${fileDirname}\\LOB-Sim.exe"
+                "${workspaceFolder}\\LOB-Sim.exe"
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$gcc"

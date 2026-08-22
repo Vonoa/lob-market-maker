@@ -283,24 +283,37 @@ you currently never print it. Add:
 
 ## Phase 3 — Plotting
 
-With Phase 2's CSV this is a short Python script, `analysis/plot_run.py`, using pandas +
-matplotlib. One function per figure, saved to `analysis/figures/`:
+**Split the work by what each tool is actually good at. Do not build the same chart twice.**
 
-1. **PnL decomposition** — realised, unrealised, total, on one time axis
-2. **Inventory over time**, with `±maxInventory` bands shaded and kill-switch trips marked
-3. **Quotes vs market** — mid, fair value, your bid and ask as a band, fills as scatter
-   (green = bought, red = sold). This is the money plot: you can *see* the strategy working
-4. **PnL distribution** across the 100 seeds — histogram with mean and ±1σ
-5. **Drawdown curve**
-6. **Mark-out curve** — average PnL at 1s / 5s / 30s after a fill (Phase 4.4). If it slopes
-   down you're being picked off, and being able to say that sentence in an interview is worth
-   more than the rest of the project combined
-7. **Strategy comparison** — same axes, one line per strategy (Phase 6)
+**ImPlot (Phase 7) owns everything live and single-run** — market/fair value/quote band, inventory
+against its limits, cumulative P&L, the ladder, the tape. Real-time scrolling with zoom and hover
+beats matplotlib for watching a run, and Python adds nothing here. Don't write a `plot_run.py`
+that duplicates your GUI panels.
 
-Keep the plots plain: no gridlines fighting the data, one accent colour, direct labels rather
-than legends where you can. These end up in the README and they are the first thing anyone sees.
+**The CSV recorder earns its place regardless of whether you ever write Python.** A run that
+exists only as pixels is gone when the window closes. You need it on disk to compare against last
+week's run, to back the "Export CSV" button already in your mockup, and to answer "where did that
+number come from" months later in an interview. That's persistence, not plotting.
 
-Add `analysis/requirements.txt` — pandas, matplotlib, numpy.
+**Python (pandas + matplotlib, in `analysis/`) owns the cross-run work ImPlot is bad at:**
+
+1. **Sweep heatmaps** — Sharpe over the `spread × γ` grid from Phase 6.3. The output is a table of
+   40+ runs to pivot, not a time series to watch. Three lines in pandas; hand-written groupby and
+   pivot logic in C++. The question that matters — *is the good region a broad plateau or a narrow
+   spike?* — is plateau = real edge, spike = fit the seed
+2. **P&L distribution across seeds** — histogram with mean and ±1σ, plus a bootstrap confidence
+   interval on the mean. "Is this edge distinguishable from zero?" is a resampling question and
+   you do not want to write it in C++
+3. **Mark-out regressions** — markout against trade size, book imbalance, and volatility, to find
+   *what* predicts getting picked off rather than just how often it happens
+4. **Inventory autocorrelation** — how long does the position take to mean-revert?
+5. **Static README figures** — you cannot embed an ImGui window in a README, and screenshots of a
+   dark UI crop badly and are sized for a screen, not a page. matplotlib gives labelled PNGs
+
+Add `analysis/requirements.txt` — pandas, matplotlib, numpy, scipy.
+
+Worth saying out loud in an interview: engine in C++, research layer in Python is the split real
+desks use. It isn't a shortcut, it's the standard pattern.
 
 ---
 

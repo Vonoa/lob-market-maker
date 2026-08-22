@@ -1,75 +1,74 @@
+#include <chrono>
 #include <iostream>
 #include <vector>
 #include <cmath>
 
-#include "Order.h"
-#include "OrderBook.h"
-#include "MatchingEngine.h"
-#include "MarketMaker.h"
-#include "RandomTrader.h"
+#include "SimulationEngine.h"
 #include "DefaultStrategy.h"
 #include "FixedSpreadStrategy.h"
-#include "HistoricalDataReplay.h"
+#include "Recorder.h"
 
 // Replays real trade data instead of RandomTrader's synthetic flow. Note the risk
-// parameters passed to MarketMaker here are BTC-scale, not the ~$100 synthetic-sim
-// defaults - see the scale-mismatch discussion (quantity scaling inflates exposure/PnL
-// by 1,000,000x, and BTC's real price/size scale is totally different from ~$100 stocks).
-double runHistoricalSimulation(const std::string& filepath, int maxRows, Strategy& strategy) {
-    OrderBook orderBook;
-    MatchingEngine engine(orderBook);
+// parameters here are BTC-scale, not the ~$100 synthetic-sim defaults - see the
+// scale-mismatch discussion (quantity scaling inflates exposure/PnL by 1,000,000x,
+// and BTC's real price/size scale is totally different from ~$100 stocks).
+//
+// Recorded here, not in runSimulation()'s Monte Carlo loop - this is the one
+// genuinely meaningful run worth a tick-by-tick CSV; recording all 100 Monte
+// Carlo seeds would produce 100 files nobody's going to look at individually.
+double runHistoricalSimulation(const std::string& filepath, int maxRows, Strategy& strategy,
+                                const std::string& runLabel) {
+    SimConfig config;
+    config.source   = SimConfig::Source::Historical;
+    config.dataPath = filepath;
+    config.maxTicks = maxRows;
+    config.quoteSize    = 2000;
+    config.maxInventory = 50000;
+    config.maxOrderSize = 5000;
+    config.maxLoss      = 1000000000.0;
+    config.maxExposure  = 5000000000.0;
 
-    // Seed near the real starting price for this file, not the ~100 synthetic placeholder
-    orderBook.addOrder(createOrder(OrderSide::BUY, 62899.50, 2000));
-    orderBook.addOrder(createOrder(OrderSide::SELL, 62900.50, 2000));
-
-    MarketMaker marketMaker(orderBook, engine, strategy,
-                             50000, 5000, 1000000000.0, 5000000000.0);
-    HistoricalDataReplay replay(filepath);
-
-    engine.setOnTrade([&marketMaker](const Trade& trade) {
-        marketMaker.onTrade(trade);
-    });
-
-    int rowsProcessed = 0;
-    Order historicalOrder;
-    while (rowsProcessed < maxRows && replay.nextOrder(historicalOrder)) {
-        marketMaker.quote(2000);
-        engine.process(historicalOrder);
-        rowsProcessed++;
+    SimulationEngine engine(config, strategy);
+    Recorder recorder(runLabel + "_ticks.csv");
+    while (engine.step()) {
+        recorder.record(engine.snapshot());
     }
 
-    return marketMaker.getTotalPnL();
+    const SimSnapshot& result = engine.snapshot();
+
+    // Real historical data trends - a totalPnL alone can't say whether that came from
+    // market-making edge or just from holding a position while price drifted. Print the
+    // split so it's visible right where the confound actually shows up.
+    std::cout << "  spreadPnL (real $): " << result.spreadPnL / 1000000.0
+               << ", inventoryPnL (real $): " << result.inventoryPnL / 1000000.0 << "\n";
+
+    // Phase 2.3 metrics - accumulated by the recorder in the same pass as the CSV rows.
+    // Sharpe and timeWeightedAbsInventory are honest approximations (per-tick, not
+    // annualized/clock-weighted) since SimSnapshot doesn't carry real tape timestamps yet.
+    RunSummary summary = recorder.summary();
+    std::cout << "  sharpe (per-tick): " << summary.sharpe
+               << ", maxDrawdown (real $): " << summary.maxDrawdown / 1000000.0
+               << ", fillRate: " << summary.fillRate
+               << ", spreadCapture/fill (real $): " << summary.spreadCapturePerFill / 1000000.0
+               << ", timeWeightedAbsInventory: " << summary.timeWeightedAbsInventory << "\n";
+    writeSummaryJson(summary, runLabel + "_summary.json");
+
+    return result.totalPnL;
 }
 
-double runSimulation(unsigned int seed, Strategy& strategy){
+double runSimulation(unsigned int seed, Strategy& strategy) {
+    SimConfig config;
+    config.source   = SimConfig::Source::Synthetic;
+    config.seed     = seed;
+    config.maxTicks = 100; // matches the old numRounds
+    config.quoteSize = 10;
+    // maxInventory/maxOrderSize/maxLoss/maxExposure keep SimConfig's own defaults
+    // (100/50/1000.0/5000.0), matching what MarketMaker's own defaults gave the old code.
 
-    OrderBook orderBook;
-    MatchingEngine engine(orderBook);
+    SimulationEngine engine(config, strategy);
+    while (engine.step()) {}
 
-    // Seed an initial two-sided market so quote() has something to center on
-    orderBook.addOrder(createOrder(OrderSide::BUY, 99.90, 10));
-    orderBook.addOrder(createOrder(OrderSide::SELL, 100.10, 10));
-
-    MarketMaker marketMaker(orderBook, engine, strategy);
-    RandomTrader randomTrader(orderBook, seed);
-
-    // Feed every trade back to the market maker so it can track fills against its own quotes
-    engine.setOnTrade([&marketMaker](const Trade& trade) {
-        marketMaker.onTrade(trade);
-    });
-
-    const int numRounds = 100;
-    for (int round = 0; round < numRounds; ++round) {
-        marketMaker.quote(10);
-
-        if (randomTrader.shouldTrade()) {
-            Order randomOrder = randomTrader.generateOrder();
-            engine.process(randomOrder);
-        }
-    }
-
-    return marketMaker.getTotalPnL();
+    return engine.snapshot().totalPnL;
 }
 
 std::vector<double> runMonteCarlo(Strategy& strategy, int numSims) {
@@ -124,10 +123,24 @@ int main() {
     printStats("FixedSpreadStrategy", runMonteCarlo(fixedSpreadStrategy, numSims));
 
     std::cout << "=== Historical replay (BTCUSDT, first 1000 rows) ===\n";
-    double defaultHistPnL = runHistoricalSimulation("BTCUSDT-trades-2026-08-17.csv", 1000, defaultStrategy);
+    double defaultHistPnL = runHistoricalSimulation(LOBSIM_DATA_DIR "/BTCUSDT-trades-2026-08-17.csv", 1000, defaultStrategy,
+                                                      "run_default");
     std::cout << "DefaultStrategy     Total PnL (real $): " << defaultHistPnL / 1000000.0 << "\n";
-    double fixedHistPnL = runHistoricalSimulation("BTCUSDT-trades-2026-08-17.csv", 1000, fixedSpreadStrategy);
+    double fixedHistPnL = runHistoricalSimulation(LOBSIM_DATA_DIR "/BTCUSDT-trades-2026-08-17.csv", 1000, fixedSpreadStrategy,
+                                                    "run_fixedspread");
     std::cout << "FixedSpreadStrategy Total PnL (real $): " << fixedHistPnL / 1000000.0 << "\n";
+
+    // Phase 5.3 - the full file, not just the first 1000 rows. 3,000,000 is comfortably
+    // above the file's real ~2.11M rows; HistoricalDataReplay::nextOrder() returning
+    // false on genuine exhaustion is what actually ends the run, not this cap.
+    std::cout << "\n=== Full historical replay (BTCUSDT, entire file) ===\n";
+    auto start = std::chrono::steady_clock::now();
+    double fullHistPnL = runHistoricalSimulation(LOBSIM_DATA_DIR "/BTCUSDT-trades-2026-08-17.csv", 3000000, defaultStrategy,
+                                                   "run_default_full");
+    auto end = std::chrono::steady_clock::now();
+    double seconds = std::chrono::duration<double>(end - start).count();
+    std::cout << "DefaultStrategy Full Total PnL (real $): " << fullHistPnL / 1000000.0 << "\n";
+    std::cout << "Wall-clock: " << seconds << "s\n";
 
     return 0;
 }

@@ -58,3 +58,7 @@ bool HistoricalDataReplay::nextOrder(Order& out) {
 
     return false; // genuinely out of usable rows
 }
+
+bool HistoricalDataReplay::isOpen() const {
+    return file.is_open();
+}
