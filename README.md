@@ -118,6 +118,37 @@ long-to-short position flip in a single fill, which is where cost-basis bugs lik
 - **Windows/MinGW-tested build** — CMake should work cross-platform, but the toolchain has only
   been exercised on Windows with MinGW so far.
 
+## How this was built
+
+I used an AI assistant (Claude) on this project, and it's worth being clear about where.
+
+**Heavily, for the GUI.** The Dear ImGui / ImPlot / GLFW front end in `gui/` was written with a
+lot of AI help. I had no front-end C++ experience going in, and I wanted this project to be
+something people could *watch* — a book ladder filling up, quotes moving, inventory swinging
+against its limit — rather than a wall of terminal output. Learning an entire GUI stack well
+enough to build that from scratch would have cost more time than the visualisation was worth,
+so I used help to get there. `GUI_LEARNING_NOTES.md` is what I wrote for myself before starting:
+the immediate-mode model, what FetchContent actually does, where the MinGW toolchain fight was
+going to be. I understood what I was building before I built it.
+
+**The engine is mine.** The order book, matching engine, market maker, cost-basis P&L accounting
+and both strategies were designed and written by me. I used AI as a reviewer there, and that
+turned out to be the more valuable use of it — it caught real problems in decisions I'd made
+early on. Two examples that changed the project:
+
+- Marking P&L against the book's mid price during historical replay. Nothing in a trades-only
+  replay ever *cancels* a resting order, so the book silently fills up with stale liquidity a
+  real exchange would have pulled, and the resulting mid drifts and then jumps in steps. That
+  was injecting fake P&L into the spread/inventory split. The fix — a single `referencePrice()`
+  that every mark, exposure and kill-switch check goes through — is described in the design
+  notes above.
+- The market maker was reading its own quotes back in as market data, because at BTC scale its
+  own resting orders dominated top of book. That's a feedback loop, and it was flattering the
+  adverse-selection numbers.
+
+Neither of those is a bug you find by running the code; both showed up in review. I'd rather
+say that plainly than have the GUI quietly imply I'm a front-end developer.
+
 ## Roadmap
 
 `ROADMAP.md` was written early as a phased plan and most of it (Phases 0–5, most of 7) is now
