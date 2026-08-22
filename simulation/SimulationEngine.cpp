@@ -50,9 +50,9 @@ SimulationEngine::SimulationEngine(SimConfig config, Strategy& strategy)
 }
 
 bool SimulationEngine::step() {
-    // TODO 4: Tick-limit check.
-    // This one's a straight port: if we've already run config.maxTicks ticks,
-    // return false immediately, same as any of the existing loops.
+    // Run length is bounded by config.maxTicks, matching the CLI loops this
+    // replaced. Returning false is how the caller (CLI loop or GUI frame) is
+    // told the run is over.
     if (currentTick >= config.maxTicks) {
         return false;
     }
@@ -79,15 +79,12 @@ bool SimulationEngine::step() {
     tickLastFillPrice = 0.0;
     tickLastFillQty = 0;
 
-    // TODO 5: Get the next order, branching on config.source.
-    // Figure out: RandomTrader's flow is two calls - one to decide IF a trade
-    // happens this tick, one to actually build it. HistoricalDataReplay's flow
-    // is one call that does both (returns false when the file's exhausted).
-    // These are NOT the same shape - collapsing them into one boolean naively
-    // is the easiest place to introduce a bug. Ask yourself: if the synthetic
-    // side decides "no trade this tick", should step() return false (stopping
-    // the whole run) or true (just an uneventful tick)? Those are very
-    // different behaviours and the code has to tell them apart explicitly.
+    // The two order sources have deliberately different shapes, and the
+    // difference matters: RandomTrader splits "does a trade happen this tick"
+    // from "build it", so a quiet tick is a normal tick and the run continues.
+    // HistoricalDataReplay answers both at once, and a false return means the
+    // file is exhausted - i.e. the run is genuinely over. Collapsing the two
+    // into one boolean would end every synthetic run at its first quiet tick.
     Order incomingOrder;
     bool haveOrder = false;
 
@@ -131,9 +128,10 @@ bool SimulationEngine::step() {
 }
 
 void SimulationEngine::refreshSnapshot() {
-    // Every field below is a direct getter call - no real "figuring out" needed
-    // for most of them, just knowing which existing method answers it. The two
-    // marked NOTE are the ones with a non-obvious right answer.
+    // One flat copy of engine state into the snapshot the GUI and recorder both
+    // read. Deliberately a copy rather than handing out references into live
+    // engine internals - consumers can hold a snapshot across frames without
+    // it mutating underneath them mid-render.
 
     latestSnapshot.tick = currentTick;
 
