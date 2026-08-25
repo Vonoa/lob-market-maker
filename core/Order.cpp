@@ -2,7 +2,7 @@
 #include <iostream>
 
 // Creating a Order
-Order createOrder(OrderSide side, double price, int64_t quantity) {
+Order createOrder(OrderSide side, double price, int64_t quantity, int64_t timestampNs) {
     static int nextId = 1;
 
     Order order;
@@ -10,6 +10,7 @@ Order createOrder(OrderSide side, double price, int64_t quantity) {
     order.side = side;
     order.price = price;
     order.quantity = quantity;
+    order.timestampNs = timestampNs;
 
     return order;
 }

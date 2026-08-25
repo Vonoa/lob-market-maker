@@ -42,12 +42,18 @@ bool HistoricalDataReplay::nextOrder(Order& out) {
             // quantity field - option 1 from our design discussion (millionths of a BTC).
             int64_t quantity = static_cast<int64_t>(rawQty * 1000000.0);
 
+            // fields[4] is Binance's trade time in microseconds since epoch (verified
+            // against the actual CSVs: e.g. 1741564800005066 on the 2025-03-10 file
+            // decodes to that same date). Convert to nanoseconds for consistency with
+            // the rest of the sim's timestampNs fields.
+            int64_t timestampNs = std::stoll(fields[4]) * 1000;
+
             // isBuyerMaker == "True" means the buyer was the resting/passive side,
             // so the SELLER was the aggressor here - this behaves like a taker SELL.
             // isBuyerMaker == "False" means the buyer was the aggressor - a taker BUY.
             OrderSide side = (fields[5] == "True") ? OrderSide::SELL : OrderSide::BUY;
 
-            out = createOrder(side, price, quantity);
+            out = createOrder(side, price, quantity, timestampNs);
             return true;
         } catch (const std::exception&) {
             // stod couldn't parse this row as a number - skip it and try the next line

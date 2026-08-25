@@ -29,7 +29,9 @@ void MatchingEngine::process(Order order) {
                 order.id,
                 ask->id,
                 ask->price,
-                tradeQuantity
+                tradeQuantity,
+                order.timestampNs,
+                order.side
             };
 
             nextTradeId++;
@@ -73,7 +75,9 @@ void MatchingEngine::process(Order order) {
                 bid->id,
                 order.id,
                 bid->price,
-                tradeQuantity
+                tradeQuantity,
+                order.timestampNs,
+                order.side
             };
 
             nextTradeId++;

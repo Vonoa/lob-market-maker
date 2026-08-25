@@ -72,6 +72,24 @@ double OrderBook::spread() const {
     return 0.0; // No valid spread if either bid or ask is missing
 }
 
+double OrderBook::microprice() const {
+    if (bids.empty() || asks.empty()) {
+        return 0.0; // no data sentinel, same convention as bestBid()/bestAsk()
+    }
+
+    // Reuses topLevels() (already sums resting quantity per level) rather than
+    // walking the deques again here.
+    BookLevel bidLevel = topLevels(bids, 1).front();
+    BookLevel askLevel = topLevels(asks, 1).front();
+    int64_t totalSize = bidLevel.totalQuantity + askLevel.totalQuantity;
+    if (totalSize == 0) {
+        return (bidLevel.price + askLevel.price) / 2.0; // shouldn't happen - levels are never left empty
+    }
+
+    return (static_cast<double>(bidLevel.totalQuantity) * askLevel.price
+          + static_cast<double>(askLevel.totalQuantity) * bidLevel.price) / static_cast<double>(totalSize);
+}
+
 std::vector<BookLevel> OrderBook::getBidLevels(size_t depth) const {
     return topLevels(bids, depth);
 }

@@ -1,7 +1,7 @@
 #include "FixedSpreadStrategy.h"
-Quote FixedSpreadStrategy::computeQuote(double midPrice, int64_t inventory, double volatility, double orderBookSpread) const {
-    Quote quote;
-    quote.bidPrice = midPrice - fixedSpread / 2.0;
-    quote.askPrice = midPrice + fixedSpread /2.0;
-    return quote;
+Quotes FixedSpreadStrategy::computeQuotes(const MarketState& state) {
+    Quotes quotes;
+    quotes.bid.price = state.mid - fixedSpread / 2.0;
+    quotes.ask.price = state.mid + fixedSpread / 2.0;
+    return quotes;
 }

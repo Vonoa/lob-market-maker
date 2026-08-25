@@ -57,6 +57,7 @@ add_executable(lobsim_tests
     tests/test_orderbook.cpp
     tests/test_matching_engine.cpp
     tests/test_cost_basis.cpp
+    tests/test_event_queue.cpp
     core/Order.cpp
     core/OrderBook.cpp
     core/MatchingEngine.cpp
@@ -64,9 +65,17 @@ add_executable(lobsim_tests
     core/FairValueModel.cpp
     core/Logging.cpp
     strategies/DefaultStrategy.cpp
+    strategies/FixedSpreadStrategy.cpp
+    simulation/RandomTrader.cpp
+    simulation/HistoricalDataReplay.cpp
+    simulation/SimulationEngine.cpp
+    simulation/Recorder.cpp
 )
 target_include_directories(lobsim_tests PRIVATE ${LOBSIM_INCLUDE_DIRS})
 target_link_libraries(lobsim_tests PRIVATE doctest::doctest)
+# test_event_queue.cpp exercises SimulationEngine's Historical path against a
+# real (small slice of a) data file - same mechanism main.cpp uses.
+target_compile_definitions(lobsim_tests PRIVATE LOBSIM_DATA_DIR="${CMAKE_SOURCE_DIR}/data")
 
 include(${doctest_SOURCE_DIR}/scripts/cmake/doctest.cmake)
 doctest_discover_tests(lobsim_tests)

@@ -21,7 +21,13 @@ double runHistoricalSimulation(const std::string& filepath, int maxRows, Strateg
     SimConfig config;
     config.source   = SimConfig::Source::Historical;
     config.dataPath = filepath;
-    config.maxTicks = maxRows;
+    // SimulationEngine::step() now advances one EVENT, not one CSV row (see its
+    // class comment) - each row can spawn up to ~5 events (the order arriving,
+    // the requote decision it triggers, up to two cancels for what was
+    // resting, and the new quote reaching the book). Scaling by 5 keeps
+    // maxRows meaning approximately what it says rather than silently
+    // stopping ~5x earlier than the caller asked for.
+    config.maxTicks = maxRows * 5;
     config.quoteSize    = 2000;
     config.maxInventory = 50000;
     config.maxOrderSize = 5000;
@@ -43,10 +49,11 @@ double runHistoricalSimulation(const std::string& filepath, int maxRows, Strateg
                << ", inventoryPnL (real $): " << result.inventoryPnL / 1000000.0 << "\n";
 
     // Phase 2.3 metrics - accumulated by the recorder in the same pass as the CSV rows.
-    // Sharpe and timeWeightedAbsInventory are honest approximations (per-tick, not
-    // annualized/clock-weighted) since SimSnapshot doesn't carry real tape timestamps yet.
+    // sharpe is now annualized from SimSnapshot's real timestampNs (see Recorder::summary());
+    // timeWeightedAbsInventory is still an honest approximation (tick-weighted, not
+    // clock-weighted).
     RunSummary summary = recorder.summary();
-    std::cout << "  sharpe (per-tick): " << summary.sharpe
+    std::cout << "  sharpe (annualized): " << summary.sharpe
                << ", maxDrawdown (real $): " << summary.maxDrawdown / 1000000.0
                << ", fillRate: " << summary.fillRate
                << ", spreadCapture/fill (real $): " << summary.spreadCapturePerFill / 1000000.0
@@ -60,7 +67,10 @@ double runSimulation(unsigned int seed, Strategy& strategy) {
     SimConfig config;
     config.source   = SimConfig::Source::Synthetic;
     config.seed     = seed;
-    config.maxTicks = 100; // matches the old numRounds
+    // x5 for the events-per-row-equivalent scaling (see runHistoricalSimulation's
+    // comment) - SimulationEngine::step() now advances one EVENT, not one round,
+    // so this keeps roughly the old numRounds=100 worth of actual synthetic rounds.
+    config.maxTicks = 100 * 5;
     config.quoteSize = 10;
     // maxInventory/maxOrderSize/maxLoss/maxExposure keep SimConfig's own defaults
     // (100/50/1000.0/5000.0), matching what MarketMaker's own defaults gave the old code.
@@ -130,9 +140,10 @@ int main() {
                                                     "run_fixedspread");
     std::cout << "FixedSpreadStrategy Total PnL (real $): " << fixedHistPnL / 1000000.0 << "\n";
 
-    // Phase 5.3 - the full file, not just the first 1000 rows. 3,000,000 is comfortably
-    // above the file's real ~2.11M rows; HistoricalDataReplay::nextOrder() returning
-    // false on genuine exhaustion is what actually ends the run, not this cap.
+    // Phase 5.3 - the full file, not just the first 1000 rows. 3,000,000 rows (x5 for the
+    // events-per-row scaling above) is comfortably above the file's real ~2.11M rows;
+    // HistoricalDataReplay::nextOrder() returning false on genuine exhaustion is what
+    // actually ends the run, not this cap.
     std::cout << "\n=== Full historical replay (BTCUSDT, entire file) ===\n";
     auto start = std::chrono::steady_clock::now();
     double fullHistPnL = runHistoricalSimulation(LOBSIM_DATA_DIR "/BTCUSDT-trades-2026-08-17.csv", 3000000, defaultStrategy,

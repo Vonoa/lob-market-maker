@@ -1,7 +1,10 @@
 #include "RandomTrader.h"
 
 RandomTrader::RandomTrader(OrderBook& orderBook, unsigned int seed)
-    : orderBook(orderBook), rng(seed) {}
+    // clockRng gets a distinct seed (not just `seed`) so its draws never coincide with
+    // rng's own state trajectory for the same seed - avoids the two streams accidentally
+    // correlating for particular seed values.
+    : orderBook(orderBook), rng(seed), clockRng(seed + 0x9E3779B9u) {}
 
 void RandomTrader::maybeSwitchRegime() {
     roundsSinceSwitch++;
@@ -47,8 +50,20 @@ bool RandomTrader::shouldTrade() {
     maybeSwitchRegime();
     updateRegimeParameters();
 
+    // Advance the synthetic clock once per round too, regardless of whether this
+    // round decides to trade - this stamps a monotonic wall-clock onto the round
+    // sequence without touching the tuned tradeProbability/regime Bernoulli logic.
+    // interArrivalUnit is Exp(1); scaling its draw by meanInterArrivalNs gives an
+    // Exp(1/meanInterArrivalNs) inter-arrival time without reconstructing the
+    // distribution's parameters every call.
+    simClockNs += static_cast<int64_t>(meanInterArrivalNs * interArrivalUnit(clockRng));
+
     std::bernoulli_distribution tradeRoll(tradeProbability);
     return tradeRoll(rng);
+}
+
+int64_t RandomTrader::currentTimeNs() const {
+    return simClockNs;
 }
 
 Order RandomTrader::generateOrder() {
@@ -75,5 +90,5 @@ Order RandomTrader::generateOrder() {
     std::uniform_int_distribution<int> sizeDist(minSize, maxSize);
     int quantity = sizeDist(rng);
 
-    return createOrder(side, price, quantity);
+    return createOrder(side, price, quantity, simClockNs);
 }

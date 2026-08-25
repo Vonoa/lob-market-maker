@@ -1,22 +1,23 @@
 #include "DefaultStrategy.h"
 #include <algorithm>
 
-Quote DefaultStrategy::computeQuote(double midPrice, int64_t inventory, double volatility, double orderBookSpread) const {
-    (void)orderBookSpread; // deliberately unused - see baseSpread comment in the header
-
-    double effectiveSpread = baseSpread + volatilityMultiplier * volatility;
+Quotes DefaultStrategy::computeQuotes(const MarketState& state) {
+    // state.bookSpread deliberately unused - see baseSpread comment in the header.
+    // state.volatility (per-EVENT), not volatilityPerSecond - this is the exact
+    // quantity these constants were empirically tuned against.
+    double effectiveSpread = baseSpread + volatilityMultiplier * state.volatility;
     double halfSpread = effectiveSpread / 2.0;
 
     // Clamped to skewClampFraction * halfSpread - see the header comment for
     // why an unclamped shift can push a quote past the true mid price.
-    double rawShift = skewCoefficient * inventory / 2.0;
+    double rawShift = skewCoefficient * state.inventory / 2.0;
     double maxShift = skewClampFraction * halfSpread;
     double shift = std::max(-maxShift, std::min(maxShift, rawShift));
 
-    double reservationPrice = midPrice - shift;
+    double reservationPrice = state.mid - shift;
 
-    Quote quote;
-    quote.bidPrice = reservationPrice - halfSpread;
-    quote.askPrice = reservationPrice + halfSpread;
-    return quote;
+    Quotes quotes;
+    quotes.bid.price = reservationPrice - halfSpread;
+    quotes.ask.price = reservationPrice + halfSpread;
+    return quotes;
 }

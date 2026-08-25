@@ -40,12 +40,12 @@ double MarketMaker::referencePrice() const {
     return calcMidPrice();
 }
 
-Order MarketMaker::createBid(double price, int64_t quantity) const {
-    return createOrder(OrderSide::BUY, price, quantity);
+Order MarketMaker::createBid(double price, int64_t quantity, int64_t timestampNs) const {
+    return createOrder(OrderSide::BUY, price, quantity, timestampNs);
 }
 
-Order MarketMaker::createAsk(double price, int64_t quantity) const {
-    return createOrder(OrderSide::SELL, price, quantity);
+Order MarketMaker::createAsk(double price, int64_t quantity, int64_t timestampNs) const {
+    return createOrder(OrderSide::SELL, price, quantity, timestampNs);
 }
 
 void MarketMaker::cancelQuotes() {
@@ -227,8 +227,8 @@ void MarketMaker::setUseTradeBasedReference(bool value) {
     useTradeBasedReference = value;
 }
 
-void MarketMaker::recordExternalPrice(double price) {
-    fairValueModel.recordPrice(price);
+void MarketMaker::recordExternalPrice(double price, int64_t timestampNs) {
+    fairValueModel.recordPrice(price, timestampNs);
 }
 
 double MarketMaker::getExposure() const {
@@ -242,6 +242,14 @@ double MarketMaker::getExposure() const {
 }
 
 void MarketMaker::onTrade(const Trade& trade) {
+    // Every trade the matching engine executes reaches here (this function IS
+    // MatchingEngine's onTrade callback - see the wiring in SimulationEngine),
+    // own or not, so this is the natural place to forward all of them to the
+    // strategy - the hook a belief-updating strategy (e.g. Glosten-Milgrom)
+    // needs to observe flow it wasn't part of. Unconditional: fires even on a
+    // self-trade or a trade neither of this MM's sides was part of.
+    strategy.onTrade(trade);
+
     // trade.price is the RESTING order's price (see MatchingEngine::process),
     // not an independent market observation - when this MM's own quote is
     // what's resting (routine at BTC scale, where quoteSize dwarfs typical
@@ -254,7 +262,7 @@ void MarketMaker::onTrade(const Trade& trade) {
     // recordExternalPrice() and its caller in SimulationEngine::step()) -
     // Synthetic mode has no such external feed, so it still needs this.
     if (!useTradeBasedReference) {
-        fairValueModel.recordPrice(trade.price); // every fill is a real market price observation
+        fairValueModel.recordPrice(trade.price, trade.timestampNs); // every fill is a real market price observation
     }
 
     // P&L attribution: mark-to-market the position we were ALREADY holding against this
@@ -310,6 +318,8 @@ void MarketMaker::onTrade(const Trade& trade) {
         totalFillCount++;   // counted now, not when judged - see the resolution block above
         buyFillCount++;
         totalFilledVolume += trade.quantity;
+        strategy.onFill(Fill{OrderSide::BUY, trade.price, trade.quantity,
+                              std::abs(trade.price - midAtLastBidQuote), trade.timestampNs});
     }
     if (filledAsk) {
         updateCostBasis(trade.quantity, trade.price, OrderSide::SELL);
@@ -321,6 +331,8 @@ void MarketMaker::onTrade(const Trade& trade) {
         totalFillCount++;   // counted now, not when judged - see the resolution block above
         sellFillCount++;
         totalFilledVolume += trade.quantity;
+        strategy.onFill(Fill{OrderSide::SELL, trade.price, trade.quantity,
+                              std::abs(trade.price - midAtLastAskQuote), trade.timestampNs});
     }
 
     // Checked after this fill's effects are applied, so it judges PnL that actually
@@ -333,17 +345,14 @@ void MarketMaker::onTrade(const Trade& trade) {
     }
 }
 
-void MarketMaker::quote(int64_t quantity) {
+bool MarketMaker::checkCanQuote() {
     if (killswitch) {
         if (Logging::currentLevel >= LogLevel::Debug) {
             std::cout << "Market Maker halted - kill switch active. Call resetKillSwitch() to resume.\n";
         }
-        return;
+        return false;
     }
 
-    // Checks calcMidPrice() itself (live book, or the fair-value fallback), not the raw
-    // book directly - the raw book alone would still fail this the instant cancelQuotes()
-    // below pulls our own resting orders, even though we can now still price off fair value.
     if (calcMidPrice() == 0.0) {
         cannotQuoteCount++;
         if (cannotQuoteCount == 1) {
@@ -353,10 +362,13 @@ void MarketMaker::quote(int64_t quantity) {
             std::cerr << "Error: Cannot quote - no live market and no fair value history yet. "
                        << "(further occurrences this run will be counted but not logged)" << std::endl;
         }
-        return;
+        return false;
     }
-    int64_t size = std::min(quantity, maxOrderSize); // clamp to the max single-order size rather than refusing to quote at all
 
+    return true;
+}
+
+MarketState MarketMaker::buildMarketState(int64_t timestampNs) const {
     // Reference price for the STRATEGY's own pricing decision. Ordinarily
     // just calcMidPrice() (the live book) - useTradeBasedReference switches
     // to fairValueModel's EWMA of real trade prices instead, for the case
@@ -370,49 +382,136 @@ void MarketMaker::quote(int64_t quantity) {
     // orders sitting untouched in the book.
     double reference = referencePrice();
 
-    // Computed once, up front, so both sides price off the exact same snapshot of
+    MarketState state;
+    state.timestampNs = timestampNs;
+    state.mid = reference;
+    state.microprice = orderBook.microprice();
+    state.fairValue = fairValueModel.getFairValue();
+    state.bookSpread = orderBook.spread();
+    state.volatility = fairValueModel.getVolatility();
+    state.volatilityPerSecond = fairValueModel.getVolatilityPerSecond();
+    state.bidLevels = orderBook.getBidLevels(10);
+    state.askLevels = orderBook.getAskLevels(10);
+    state.inventory = inventory;
+    state.inventoryLimit = maxInventory;
+    // timeRemaining/timeRemainingSeconds left at MarketState's defaults (1.0/0.0) -
+    // MarketMaker has no session-horizon concept yet.
+    return state;
+}
+
+Quotes MarketMaker::decideQuotes(const MarketState& state) {
+    return strategy.computeQuotes(state);
+}
+
+bool MarketMaker::hasRestingBid() const {
+    return currentBidId != NO_QUOTE_ID;
+}
+
+bool MarketMaker::hasRestingAsk() const {
+    return currentAskId != NO_QUOTE_ID;
+}
+
+int MarketMaker::getCurrentBidId() const {
+    return currentBidId;
+}
+
+int MarketMaker::getCurrentAskId() const {
+    return currentAskId;
+}
+
+void MarketMaker::cancelSpecificOrder(int orderId, OrderSide side) {
+    orderBook.cancelOrder(orderId); // no-op if already gone (e.g. already filled)
+
+    // Only clear OUR bookkeeping if this id is still what we think is resting -
+    // a newer quote may already have replaced currentBidId/currentAskId by the
+    // time a delayed cancel arrives, in which case this cancel targets a stale
+    // order that a fresher quote has nothing to do with.
+    if (side == OrderSide::BUY && currentBidId == orderId) {
+        currentBidId = NO_QUOTE_ID;
+        lastBidPrice = 0.0;
+    } else if (side == OrderSide::SELL && currentAskId == orderId) {
+        currentAskId = NO_QUOTE_ID;
+        lastAskPrice = 0.0;
+    }
+}
+
+// canBuy()/canSell() only decide WHETHER to quote a side. On their own they let a fill
+// carry inventory past the limit by up to (size - 1), since nothing stopped a full-size
+// quote going out with only a sliver of headroom left. Clamping to the remaining headroom
+// is what makes maxInventory an actual limit rather than a trigger. side.size is an
+// additional ceiling from the strategy itself - it can only shrink this further (defaults
+// to "no cap", so a strategy that doesn't decide sizing behaves exactly as quote() always did).
+bool MarketMaker::postBid(const QuoteSide& side, int64_t requestedSize, double referenceMid, int64_t timestampNs) {
+    bool verbose = Logging::currentLevel >= LogLevel::Debug;
+    if (!canBuy() || !side.active) {
+        if (verbose) {
+            std::cout << "  bid suppressed - at max inventory (" << inventory << "/" << maxInventory
+                       << ") or declined by strategy\n";
+        }
+        return false;
+    }
+    int64_t clampedSize = std::min(requestedSize, maxOrderSize);
+    int64_t bidSize = std::min({clampedSize, maxInventory - inventory, side.size});
+    if (bidSize <= 0) {
+        return false;
+    }
+    Order bid = createBid(side.price, bidSize, timestampNs);
+    currentBidId = bid.id; // set before process() so onTrade can attribute an immediate fill
+    lastBidPrice = side.price;
+    midAtLastBidQuote = referenceMid;
+    matchingEngine.process(bid);
+    if (verbose) {
+        printOrder(bid);
+    }
+    return true;
+}
+
+bool MarketMaker::postAsk(const QuoteSide& side, int64_t requestedSize, double referenceMid, int64_t timestampNs) {
+    bool verbose = Logging::currentLevel >= LogLevel::Debug;
+    if (!canSell() || !side.active) {
+        if (verbose) {
+            std::cout << "  ask suppressed - at min inventory (" << inventory << "/-" << maxInventory
+                       << ") or declined by strategy\n";
+        }
+        return false;
+    }
+    int64_t clampedSize = std::min(requestedSize, maxOrderSize);
+    int64_t askSize = std::min({clampedSize, maxInventory + inventory, side.size}); // headroom on the short side
+    if (askSize <= 0) {
+        return false;
+    }
+    Order ask = createAsk(side.price, askSize, timestampNs);
+    currentAskId = ask.id; // set before process() so onTrade can attribute an immediate fill
+    lastAskPrice = side.price;
+    midAtLastAskQuote = referenceMid;
+    matchingEngine.process(ask);
+    if (verbose) {
+        printOrder(ask);
+    }
+    return true;
+}
+
+void MarketMaker::quote(int64_t quantity, int64_t timestampNs) {
+    if (!checkCanQuote()) {
+        return;
+    }
+
+    // Built once, up front, so both sides price off the exact same snapshot of
     // market state rather than risking it changing between two separate calls.
-    Quote thisQuote = strategy.computeQuote(reference, inventory, fairValueModel.getVolatility(), orderBook.spread());
+    MarketState state = buildMarketState(timestampNs);
+    Quotes thisQuote = decideQuotes(state);
 
     cancelQuotes();
 
-    bool verbose = Logging::currentLevel >= LogLevel::Debug;
-    if (verbose) {
+    if (Logging::currentLevel >= LogLevel::Debug) {
         std::cout << "Market Maker Quotes:\n";
     }
 
     // Route through the matching engine (not orderBook.addOrder directly) so a quote
     // that crosses the touch - e.g. once skew shifts it off center - actually executes
     // instead of resting uncrossed in the book.
-    // canBuy()/canSell() only decide WHETHER to quote a side. On their own they let a fill
-    // carry inventory past the limit by up to (size - 1), since nothing stopped a full-size
-    // quote going out with only a sliver of headroom left. Clamping to the remaining headroom
-    // is what makes maxInventory an actual limit rather than a trigger.
-    if (canBuy()) {
-        int64_t bidSize = std::min(size, maxInventory - inventory);
-        Order bid = createBid(thisQuote.bidPrice, bidSize);
-        currentBidId = bid.id; // set before process() so onTrade can attribute an immediate fill
-        lastBidPrice = thisQuote.bidPrice;
-        matchingEngine.process(bid);
-        if (verbose) {
-            printOrder(bid);
-        }
-    } else if (verbose) {
-        std::cout << "  bid suppressed - at max inventory (" << inventory << "/" << maxInventory << ")\n";
-    }
-
-    if (canSell()) {
-        int64_t askSize = std::min(size, maxInventory + inventory); // headroom on the short side
-        Order ask = createAsk(thisQuote.askPrice, askSize);
-        currentAskId = ask.id; // set before process() so onTrade can attribute an immediate fill
-        lastAskPrice = thisQuote.askPrice;
-        matchingEngine.process(ask);
-        if (verbose) {
-            printOrder(ask);
-        }
-    } else if (verbose) {
-        std::cout << "  ask suppressed - at min inventory (" << inventory << "/-" << maxInventory << ")\n";
-    }
+    postBid(thisQuote.bid, quantity, state.mid, timestampNs);
+    postAsk(thisQuote.ask, quantity, state.mid, timestampNs);
 }
 void MarketMaker::resetKillSwitch() {
     killswitch = false;

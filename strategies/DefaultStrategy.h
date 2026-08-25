@@ -36,5 +36,5 @@ private:
     double skewClampFraction = 0.8;
 
 public:
-    Quote computeQuote(double midPrice, int64_t inventory, double volatility, double orderBookSpread) const override;
+    Quotes computeQuotes(const MarketState& state) override;
 };

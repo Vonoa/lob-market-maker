@@ -56,6 +56,13 @@ public:
     // Function to calculate the spread between best ask and best bid
     double spread() const;
 
+    // Size-weighted mid: (bidSize*ask + askSize*bid) / (bidSize + askSize).
+    // Skews toward the side with LESS resting size (the side more likely to
+    // be consumed next), unlike the plain (bid+ask)/2 mid - the standard
+    // short-horizon order-book-imbalance signal. Same 0.0 "no data" sentinel
+    // convention as bestBid()/bestAsk() when either side is empty.
+    double microprice() const;
+
     // Top `depth` price levels, best-first (highest bid / lowest ask, same
     // ordering the book itself already keeps). Returns fewer than `depth`
     // if the book doesn't have that many levels resting.

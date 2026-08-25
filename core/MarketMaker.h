@@ -49,6 +49,13 @@ private:
     double lastBidPrice = 0.0; // price of the currently-resting bid, if any (0.0 if none)
     double lastAskPrice = 0.0; // price of the currently-resting ask, if any (0.0 if none)
 
+    // The reference price EACH side was quoted against, captured at quote() time -
+    // Strategy::onFill()'s Fill::distanceFromMid needs this, and it isn't
+    // recoverable from Trade alone (trade.price is the RESTING order's price,
+    // and the mid may have moved between posting the quote and it filling).
+    double midAtLastBidQuote = 0.0;
+    double midAtLastAskQuote = 0.0;
+
     // Off by default - calcMidPrice() (the live book) is a perfectly good
     // reference price when this MM's own orders are a small fraction of
     // book liquidity (true at the synthetic ~$100 scale, where quoteSize is
@@ -61,8 +68,8 @@ public:
                 int64_t maxInventory = 100, int64_t maxOrderSize = 50,
                 double maxloss = 1000.0, double maxExposure = 5000.0);
 
-    Order createBid(double price, int64_t quantity) const;
-    Order createAsk(double price, int64_t quantity) const;
+    Order createBid(double price, int64_t quantity, int64_t timestampNs = 0) const;
+    Order createAsk(double price, int64_t quantity, int64_t timestampNs = 0) const;
 
     double calcMidPrice() const;
 
@@ -81,8 +88,68 @@ public:
     // inventory P&L split read as a directional strategy when it was measuring book staleness.
     double referencePrice() const;
 
-    void quote(int64_t quantity);
+    // timestampNs is threaded through explicitly (not stored via a setter) so
+    // MarketMaker stays synchronously testable - see tests/test_cost_basis.cpp,
+    // which calls quote() directly without a SimulationEngine driving a clock.
+    // Implemented in terms of the decomposed primitives below (decideQuotes()/
+    // postBid()/postAsk()) - kept as the single synchronous decide-cancel-post
+    // call for direct/test use. An event-driven caller wanting latency between
+    // those steps (see SimulationEngine) calls the primitives itself instead.
+    void quote(int64_t quantity, int64_t timestampNs = 0);
     void cancelQuotes();
+
+    // --- Decomposed quoting primitives -------------------------------------
+    // MarketMaker itself has no notion of time or delay - it stays "timing-
+    // agnostic" and exposes intent (decide, cancel this specific order, post
+    // that specific side) so a caller like SimulationEngine can space these
+    // calls out over simulated time to model latency, without MarketMaker
+    // needing to know latency exists.
+
+    // Same guard quote() has always applied (killswitch halt / no live market
+    // yet), including its exact messaging and cannotQuoteCount bookkeeping -
+    // pulled out so an event-driven caller (SimulationEngine) gets identical
+    // behaviour to the synchronous quote() path instead of a re-derived copy.
+    // Returns true iff it's OK to proceed with buildMarketState()/decideQuotes().
+    bool checkCanQuote();
+
+    // Snapshots current book/inventory/fair-value state as of timestampNs.
+    // Building this now vs. later matters: a caller modelling "the strategy
+    // sees a stale view" (latencyIn) must capture this AT THE EARLIER TIME and
+    // hand the SAME frozen state to decideQuotes() later - rebuilding it at
+    // decision time would read a MORE current book, the opposite of stale.
+    MarketState buildMarketState(int64_t timestampNs) const;
+
+    // Runs the strategy against a (possibly stale/frozen) MarketState. Not
+    // const: strategies may hold and update their own state.
+    Quotes decideQuotes(const MarketState& state);
+
+    bool hasRestingBid() const;
+    bool hasRestingAsk() const;
+    int getCurrentBidId() const; // meaningful only if hasRestingBid()
+    int getCurrentAskId() const; // meaningful only if hasRestingAsk()
+
+    // Cancels a SPECIFIC previously-posted order by id, not "whatever is
+    // currently resting" - needed because a newer quote may already have
+    // replaced currentBidId/currentAskId by the time a delayed cancel
+    // actually arrives. Only clears this MM's own bookkeeping
+    // (currentBidId/lastBidPrice etc.) if that id is still the current one;
+    // otherwise just removes the stale order from the book and leaves the
+    // newer quote's bookkeeping alone. Safe to call on an id already gone
+    // from the book (OrderBook::cancelOrder() is a no-op then).
+    void cancelSpecificOrder(int orderId, OrderSide side);
+
+    // Posts one side against a strategy-decided QuoteSide, applying the same
+    // maxOrderSize/inventory-headroom/strategy-size-ceiling clamping quote()
+    // always has. requestedSize is the caller's raw configured quote size
+    // (pre-maxOrderSize-clamp, matching quote()'s `quantity` parameter).
+    // referenceMid is the mid AT DECISION TIME (state.mid from the
+    // MarketState decideQuotes() was called with) - recorded as
+    // midAtLastBidQuote/midAtLastAskQuote for Fill::distanceFromMid, even
+    // though the order is only actually posted now (possibly later, under
+    // latencyOut). Returns false (no-op) if inventory/strategy declined this
+    // side or the clamped size came out non-positive.
+    bool postBid(const QuoteSide& side, int64_t requestedSize, double referenceMid, int64_t timestampNs);
+    bool postAsk(const QuoteSide& side, int64_t requestedSize, double referenceMid, int64_t timestampNs);
     int64_t getInventory() const;
     bool canBuy() const;
     bool canSell() const;
@@ -125,5 +192,5 @@ public:
     // before it's matched against anything). See the caller in
     // SimulationEngine::step() and the comment on onTrade()'s own
     // recordPrice() call for why this exists.
-    void recordExternalPrice(double price);
+    void recordExternalPrice(double price, int64_t timestampNs = 0);
 };
